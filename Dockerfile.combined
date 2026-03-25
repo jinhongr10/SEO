@@ -1,0 +1,95 @@
+# ===== Stage 1: Build Frontend =====
+FROM --platform=linux/amd64 node:20-alpine AS frontend-build
+WORKDIR /app
+
+# Install deps first for better cache
+COPY package.json package-lock.json* ./
+RUN if [ -f package-lock.json ]; then npm ci; else npm install; fi
+
+# Copy source and build
+COPY *.tsx *.ts index.html tsconfig.json vite.config.ts ./
+COPY components/ ./components/
+COPY services/ ./services/
+COPY api/ ./api/
+ARG GEMINI_API_KEY=
+ENV GEMINI_API_KEY=$GEMINI_API_KEY
+RUN npm run build
+
+# ===== Stage 2: Build Backend Dependencies =====
+FROM --platform=linux/amd64 python:3.11-slim AS backend-build
+WORKDIR /app
+COPY backend/requirements.txt ./
+RUN pip install --no-cache-dir -r requirements.txt
+
+# ===== Stage 3: Final Image with Nginx + Python + Supervisor =====
+FROM --platform=linux/amd64 python:3.11-slim AS runner
+
+# Install Nginx and Supervisor (with retry for network issues)
+RUN set -eux; \
+    ok=0; \
+    for i in 1 2 3; do \
+        if apt-get update && apt-get install -y --no-install-recommends nginx supervisor; then \
+            ok=1; \
+            break; \
+        fi; \
+        sleep 5; \
+    done; \
+    if [ "$ok" -ne 1 ]; then \
+        echo "Failed to install nginx/supervisor after retries" >&2; \
+        exit 1; \
+    fi; \
+    command -v supervisord; \
+    rm -rf /var/lib/apt/lists/*
+
+# Copy Python packages from backend-build
+COPY --from=backend-build /usr/local/lib/python3.11/site-packages /usr/local/lib/python3.11/site-packages
+COPY --from=backend-build /usr/local/bin /usr/local/bin
+
+# Copy backend code
+WORKDIR /app/backend
+COPY backend/main.py ./
+
+# Copy frontend build to nginx
+COPY --from=frontend-build /app/dist /usr/share/nginx/html
+
+# Copy nginx config
+COPY nginx.conf /etc/nginx/sites-available/default
+
+# Create supervisor config
+RUN mkdir -p /var/log/supervisor
+COPY <<EOF /etc/supervisor/supervisord.conf
+[supervisord]
+nodaemon=true
+user=root
+logfile=/var/log/supervisor/supervisord.log
+pidfile=/var/run/supervisord.pid
+
+[include]
+files = /etc/supervisor/conf.d/*.conf
+EOF
+
+COPY <<EOF /etc/supervisor/conf.d/app.conf
+[program:nginx]
+command=/usr/sbin/nginx -g "daemon off;"
+autostart=true
+autorestart=true
+stderr_logfile=/var/log/nginx/error.log
+stdout_logfile=/var/log/nginx/access.log
+
+[program:backend]
+command=/usr/local/bin/uvicorn main:app --host 0.0.0.0 --port 3004
+directory=/app/backend
+autostart=true
+autorestart=true
+stderr_logfile=/var/log/supervisor/backend.err.log
+stdout_logfile=/var/log/supervisor/backend.out.log
+environment=PYTHONUNBUFFERED=1
+EOF
+
+# Update nginx config to serve static files directly instead of proxy to 3003
+RUN sed -i 's|proxy_pass http://127.0.0.1:3003/;|try_files $uri $uri/ /index.html;|g' /etc/nginx/sites-available/default && \
+    sed -i '/proxy_set_header.*3003/d' /etc/nginx/sites-available/default
+
+EXPOSE 80
+
+CMD ["supervisord", "-c", "/etc/supervisor/supervisord.conf"]
